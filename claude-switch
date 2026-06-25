@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# claude-switch — toggle Claude Code between two accounts (personal/work).
+#
+# Usage:
+#   claude-switch          toggle to the other saved account
+#   claude-switch status   show active account and saved profiles
+#
+# Swaps ~/.claude/.credentials.json and the oauthAccount/userID keys of
+# ~/.claude.json. Everything else (settings, history, plugins) is shared.
+set -euo pipefail
+
+CLAUDE_DIR="$HOME/.claude"
+CREDENTIALS="$CLAUDE_DIR/.credentials.json"
+CONFIG="$HOME/.claude.json"
+PROFILES_DIR="$CLAUDE_DIR/profiles"
+
+die() { echo "claude-switch: $*" >&2; exit 1; }
+
+preflight() {
+    command -v jq >/dev/null || die "jq is required but not installed"
+    [[ -f "$CREDENTIALS" ]] || die "$CREDENTIALS not found — log in first (claude → /login)"
+    [[ -f "$CONFIG" ]] || die "$CONFIG not found — run claude once first"
+}
+
+active_email() {
+    jq -r '.oauthAccount.emailAddress // empty' "$CONFIG"
+}
+
+save_current_profile() {
+    local email="$1"
+    local dir="$PROFILES_DIR/$email"
+    mkdir -p "$dir"
+    chmod 700 "$PROFILES_DIR" "$dir"
+    cp "$CREDENTIALS" "$dir/credentials.json"
+    jq '{oauthAccount, userID}' "$CONFIG" > "$dir/identity.json"
+    chmod 600 "$dir/credentials.json" "$dir/identity.json"
+}
+
+other_profile() {
+    local email="$1" others=()
+    local p
+    for p in "$PROFILES_DIR"/*/; do
+        [[ -d "$p" ]] || continue
+        local name
+        name="$(basename "$p")"
+        [[ "$name" == "$email" ]] || others+=("$name")
+    done
+    case ${#others[@]} in
+        0) return 1 ;;
+        1) echo "${others[0]}" ;;
+        *) die "found multiple other profiles (${others[*]}) — toggle needs exactly two accounts" ;;
+    esac
+}
+
+restore_profile() {
+    local email="$1"
+    local dir="$PROFILES_DIR/$email"
+    [[ -f "$dir/credentials.json" && -f "$dir/identity.json" ]] \
+        || die "profile for $email is incomplete in $dir"
+
+    cp "$CONFIG" "$CONFIG.account-switch.bak"
+
+    local tmp
+    tmp="$(mktemp "$CLAUDE_DIR/.credentials.json.XXXXXX")"
+    cp "$dir/credentials.json" "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$CREDENTIALS"
+
+    tmp="$(mktemp "$HOME/.claude.json.XXXXXX")"
+    jq --slurpfile id "$dir/identity.json" \
+        '.oauthAccount = $id[0].oauthAccount | .userID = $id[0].userID' \
+        "$CONFIG" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$CONFIG"
+}
+
+warn_if_claude_running() {
+    if pgrep -x claude >/dev/null 2>&1; then
+        echo "Warning: a claude process is running. An open session may overwrite"
+        echo "the credentials file after the switch, mixing up the two accounts."
+        read -r -p "Switch anyway? [y/N] " answer
+        [[ "$answer" == [yY]* ]] || die "aborted"
+    fi
+}
+
+cmd_status() {
+    preflight
+    local email
+    email="$(active_email)"
+    if [[ -z "$email" ]]; then
+        echo "Active account: none (not logged in)"
+    else
+        local org sub
+        org="$(jq -r '.oauthAccount.organizationName // "?"' "$CONFIG")"
+        sub="$(jq -r '.claudeAiOauth.subscriptionType // "?"' "$CREDENTIALS")"
+        echo "Active account: $email ($org, $sub)"
+    fi
+    echo "Saved profiles:"
+    local found=0 p
+    for p in "$PROFILES_DIR"/*/; do
+        [[ -d "$p" ]] || continue
+        found=1
+        local name marker=""
+        name="$(basename "$p")"
+        [[ "$name" == "$email" ]] && marker="  (active)"
+        echo "  - $name$marker"
+    done
+    [[ $found -eq 1 ]] || echo "  (none yet — run claude-switch once to save the current account)"
+}
+
+cmd_toggle() {
+    preflight
+    local email
+    email="$(active_email)"
+    [[ -n "$email" ]] || die "no account logged in — run claude → /login first"
+
+    warn_if_claude_running
+    save_current_profile "$email"
+
+    local target
+    if ! target="$(other_profile "$email")"; then
+        echo "Saved current account: $email"
+        echo "No other profile exists yet. Log into your other account (claude → /login),"
+        echo "then run claude-switch again to toggle between the two."
+        exit 0
+    fi
+
+    restore_profile "$target"
+    local sub
+    sub="$(jq -r '.claudeAiOauth.subscriptionType // "?"' "$CREDENTIALS")"
+    echo "Switched: $email → $target ($sub)"
+}
+
+case "${1:-}" in
+    "") cmd_toggle ;;
+    status) cmd_status ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command: $1 (usage: claude-switch [status])" ;;
+esac
